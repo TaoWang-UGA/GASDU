@@ -1,6 +1,8 @@
 # GASDU
+Install the required packages using environment.yml.
+conda env create -f environment.yml
 
-Example usage
+Example usage to run experiment on ARC-C.
 
 python train.py arc_c \
   --model_name "GPT-OSS-20B" \
