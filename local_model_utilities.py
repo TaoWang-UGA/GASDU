@@ -5,9 +5,9 @@ SFT-aware:
   • Uses SftAdamW or SftSM3 when sft_enabled=True
   • Initializes SftSelector on train start (version-proof)
   • Calls selector.step() after each real optimizer step
-  • Keeps GOLU commit-and-swap behavior
+  • Keeps GASDU commit-and-swap behavior
 
-Also provides make_forced_labels_scheme() for GODLU_train_SpIEL.py.
+Also provides make_forced_labels_scheme() for GASDU_train_SpIEL.py.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ try:
 except Exception:  # pragma: no cover
     PreTrainedTokenizer = object  # type: ignore
 
-# GOLU utilities (commit after step; harmless for other methods)
-from godlu import golu_flush_buckets, SparseUpdateLinear
+# GASDU utilities (commit after step; harmless for other methods)
+from gasdu import gasdu_flush_buckets, SparseUpdateLinear
 
 # ---- Optimizer selection: DeepSpeed FusedAdam -> Apex FusedAdam -> torch.Adam
 _OPTIM_BACKEND = "torch"
@@ -340,9 +340,9 @@ class CustomLightningModule(L.LightningModule):
                       f"accum={self.sft_grad_accum}, completed={self.trainer.global_step}")
 
     def on_before_optimizer_step(self, optimizer):
-        # keep GOLU flushing
+        # keep GASDU flushing
         try:
-            golu_flush_buckets()
+            gasdu_flush_buckets()
         except Exception:
             pass
     
@@ -626,7 +626,7 @@ class CustomLightningModule(L.LightningModule):
                 print("[INFO] Optimizer: SFT-AdamW")
             return opt
     
-        # Non-SFT path (GOLU/LoRA/FULL)
+        # Non-SFT path (GASDU)
         optim_kwargs: Dict[str, object] = dict(lr=self.learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
         opt = _FusedAdam(params, **optim_kwargs)
         if self.global_rank == 0:
@@ -636,7 +636,7 @@ class CustomLightningModule(L.LightningModule):
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
 
-        # Commit GOLU deltas & swap next mask
+        # Commit GASDU deltas & swap next mask
         def _commit(m):
             if isinstance(m, SparseUpdateLinear):
                 m.commit_and_swap_mask()
