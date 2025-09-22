@@ -4,7 +4,9 @@ Install the required packages:
 conda env create -f environment.yml
 
 Example usage to run experiment on ARC-C.
+
 cond activate gasdu
+
 python train.py arc_c \
   --model_name "GPT-OSS-20B" \
   --finetune_method gasdu \
