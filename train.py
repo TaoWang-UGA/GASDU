@@ -1,21 +1,19 @@
 # train.py — GASDU-only fine-tuning on local datasets
+# - Commonsense tasks: load train.json (train) and test.json (validation)
+# - NumGLUE types (Type_1..Type_8): load train.json / test.json as well
 # - No internet calls. Supports .json / .jsonl (optionally .gz).
-# - Commonsense tasks now use train.json (train) and test.json (validation),
-#   mirroring the NumGLUE behavior.
-# - Math tasks keep the original behavior:
-#     *_*_1.json + test.json collected and split 90/10 deterministically.
 #
-# Assumed instruction-style records (for commonsense & many math/NumGLUE):
+# Assumed instruction-style records (commonsense):
 #   { "instruction": str, "input": str, "output": str, "answer": str }
-# We parse "Answer format:" and normalize to a discriminative label set so the
-# FIRST supervised token is unique per class (important for accuracy).
+# For NumGLUE, we normalize {question, answer, rationale?} into that schema.
+# We ensure the FIRST supervised token is unique per class when applicable.
 
 from lightning.pytorch.strategies import SingleDeviceStrategy
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-import argparse, os, sys, time, random, gzip, json, io, re, glob
+import argparse, os, sys, time, random, gzip, json, io, re
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import torch.nn as nn
@@ -44,19 +42,8 @@ COMMONSENSE_REGISTRY: Dict[str, Dict[str, Any]] = {
     "obqa":       {"classes": 4, "kind": "mc", "default_prefix": "answer"},
 }
 
-MATH_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "multiarith": {"classes": None, "kind": "open"},
-    "gsm8k":      {"classes": None, "kind": "open"},
-    "addsub":     {"classes": None, "kind": "open"},
-    "aqua":       {"classes": 5,    "kind": "mc", "default_prefix": "answer"},  # 5-way
-    "singleeq":   {"classes": None, "kind": "open"},
-    "svamp":      {"classes": None, "kind": "open"},
-    # add others if you need them
-}
-
-# Map CLI task_name → folder name under ./dataset
+# Map CLI task_name → folder name under ./dataset (commonsense only)
 TASK_FOLDER_MAP: Dict[str, str] = {
-    # commonsense
     "boolq": "boolq",
     "piqa": "piqa",
     "siqa": "social_i_qa",
@@ -65,16 +52,6 @@ TASK_FOLDER_MAP: Dict[str, str] = {
     "arc_e": "ARC-Easy",
     "arc_c": "ARC-Challenge",
     "obqa": "openbookqa",
-    # math
-    "aqua": "AQuA",
-    "gsm8k": "gsm8k",
-    "addsub": "AddSub",
-    "multiarith": "MultiArith",
-    "singleeq": "SingleEq",
-    "svamp": "SVAMP",
-    # optional extras
-    "mathqa": "mathqa",
-    "mawps": "mawps",
     # NumGLUE (Types 1–8 live directly under dataset/Type_1 ... Type_8)
     "numglue_type1": "Type_1",
     "numglue_type2": "Type_2",
@@ -87,8 +64,8 @@ TASK_FOLDER_MAP: Dict[str, str] = {
 }
 
 # ─────────────────────────────── CLI ─────────────────────────────── #
-parser = argparse.ArgumentParser(description="GASDU fine-tuning on a single local dataset")
-parser.add_argument("task_name", type=str, help="Dataset name (commonsense, math subtask, or NumGLUE type).")
+parser = argparse.ArgumentParser(description="GASDU fine-tuning on local commonsense or NumGLUE dataset")
+parser.add_argument("task_name", type=str, help="Dataset name (commonsense task or NumGLUE type).")
 parser.add_argument("--dataset_root", type=str, default="dataset", help="Root folder containing task subfolders.")
 parser.add_argument("--model_name", default="meta-llama/Meta-Llama-3-8B", help="HF model path or id.")
 parser.add_argument("--max_epoch", type=int, default=3)
@@ -100,7 +77,7 @@ parser.add_argument("--learning_rate", type=float, default=5e-5)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--stage1_only", action="store_true")
 parser.add_argument("--stage2_only", action="store_true")
-parser.add_argument("--mask_mode", default="topk", choices=["topk", "bernoulli", "fixed_topk", "topk_refresh_each_step"])
+parser.add_argument("--mask_mode", default="topk", choices=["topk", "fixed_topk", "topk_refresh_each_step"])
 parser.add_argument("--track_grad_norm_prop", action="store_true")
 parser.add_argument("--full_grad_every", type=int, default=50)
 parser.add_argument("--stage2_seeds", type=str, default="",
@@ -114,7 +91,6 @@ model_name = args.model_name
 
 # ───────────────────────────── NumGLUE helpers ───────────────────────────── #
 _NUMGLUE_ALIASES = {
-    # accept many user spellings
     "numglue_type1": 1, "numglue_t1": 1, "type1": 1, "t1": 1,
     "numglue_type2": 2, "numglue_t2": 2, "type2": 2, "t2": 2,
     "numglue_type3": 3, "numglue_t3": 3, "type3": 3, "t3": 3,
@@ -163,13 +139,12 @@ def _resolve_numglue_folder(dataset_root: str, name: str) -> str:
     )
 
 is_commonsense = task_name in COMMONSENSE_REGISTRY
-is_math = task_name in MATH_REGISTRY
 is_numglue = is_numglue_task(task_name)
 
-if not (is_commonsense or is_math or is_numglue):
+if not (is_commonsense or is_numglue):
     raise ValueError(
         f"Unknown dataset '{task_name_raw}'. Valid commonsense: {list(COMMONSENSE_REGISTRY)}; "
-        f"math: {list(MATH_REGISTRY)}; or NumGLUE types: Type1..Type8 (aliases accepted)."
+        f"or NumGLUE types: Type1..Type8 (aliases accepted)."
     )
 
 # ─────────────────────────── Output dirs ─────────────────────────── #
@@ -185,7 +160,6 @@ os.makedirs(logs_dir, exist_ok=True)
 def set_random_seed(sd: int):
     random.seed(sd); np.random.seed(sd)
     torch.manual_seed(sd); torch.cuda.manual_seed_all(sd)
-_SPLIT_SEED = 137  # fixed seed for deterministic 90/10 train/val splits (for math)
 
 # ─────────────────────── GPU pick (simple) ─────────────────────── #
 def _pick_gpu_with_lowest_mem():
@@ -198,7 +172,6 @@ def _pick_gpu_with_lowest_mem():
     if not torch.cuda.is_available():
         return None
 
-    # Hard override
     force = os.environ.get("GASDU_FORCE_LOCAL_DEVICE")
     if force is not None:
         try:
@@ -206,7 +179,6 @@ def _pick_gpu_with_lowest_mem():
         except Exception:
             return 0
 
-    # Respect LOCAL_RANK (if using DDP later)
     lr = os.environ.get("LOCAL_RANK")
     if lr is not None:
         try:
@@ -280,19 +252,21 @@ def _load_single_json_like(path: str) -> List[Dict[str, Any]]:
             if isinstance(obj, dict): out.append(obj)
         return out
 
-# ───────────────────── Math/NumGLUE normalization helpers ─────────────────── #
+# ─────────────────── Normalization for NumGLUE-like records ───────────────── #
 def _coerce_answer_to_str(x: Any) -> str:
     if isinstance(x, bool):
         return "true" if x else "false"
     if isinstance(x, int):
         return str(x)
     if isinstance(x, float):
-        from math import isclose
-        return str(int(round(x))) if isclose(x, round(x), abs_tol=1e-12) else str(x)
+        return str(int(round(x))) if abs(x - round(x)) < 1e-12 else str(x)
     return str(x).strip()
 
-def _normalize_math_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Already instruction-style?
+def _normalize_numglue_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normalize a record to instruction-style for NumGLUE-like schemas.
+    Accepts either already-instruction-style or {question, answer, rationale?}.
+    """
     if isinstance(rec.get("instruction", None), str):
         ins = rec["instruction"].strip()
         if not ins: return None
@@ -319,56 +293,7 @@ def _normalize_math_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "answer": _coerce_answer_to_str(a),
     }
 
-def _list_math_candidate_files(root: str) -> List[str]:
-    pats = [
-        "**/*_1.json", "**/*_1.json.gz", "**/*_1.jsonl", "**/*_1.jsonl.gz",
-        "**/test.json", "**/test.json.gz", "**/test.jsonl", "**/test.jsonl.gz",
-    ]
-    files: List[str] = []
-    for pat in pats:
-        files.extend(glob.glob(os.path.join(root, pat), recursive=True))
-    return sorted(set(files))
-
-def _load_task_records_from_dir(dataset_root: str, task: str) -> List[Dict[str, Any]]:
-    folder = TASK_FOLDER_MAP.get(task, task)
-    root = os.path.join(dataset_root, folder)
-    if not os.path.isdir(root):
-        raise FileNotFoundError(f"Task folder not found: {root}")
-
-    is_math_task = task in MATH_REGISTRY
-    if is_math_task:
-        files = _list_math_candidate_files(root)
-    else:
-        # not used for commonsense anymore
-        files = []
-
-    if is_math_task and not files:
-        raise RuntimeError(
-            f"No candidate files (*_1.json / test.json) found for math task '{task}' under {root}"
-        )
-
-    records: List[Dict[str, Any]] = []
-    bad_files = 0
-    for fp in files:
-        try:
-            recs = _load_single_json_like(fp)
-            for r in recs:
-                if is_math_task:
-                    nr = _normalize_math_record(r)
-                    if nr is not None and isinstance(nr.get("instruction", ""), str):
-                        records.append(nr)
-        except Exception:
-            bad_files += 1
-            continue
-
-    if bad_files:
-        print(f"[DATA] Warning: {bad_files} files failed to load under {root}")
-    if is_math_task and not records:
-        raise RuntimeError(f"No usable records for math task '{task}' from {root}")
-
-    return records
-
-# ─────────────────── Generic train/test loader (commonsense) ───────────────── #
+# ─────────────────── Commonsense train/test loader ───────────────── #
 def _load_commonsense_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     For commonsense tasks:
@@ -468,7 +393,7 @@ def _load_numglue_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[st
     bad_tr, bad_te = 0, 0
     for r in tr_raw:
         try:
-            nr = _normalize_math_record(r)
+            nr = _normalize_numglue_record(r)
             if nr is not None and isinstance(nr.get("instruction",""), str):
                 train_records.append(nr)
             else:
@@ -477,7 +402,7 @@ def _load_numglue_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[st
             bad_tr += 1
     for r in te_raw:
         try:
-            nr = _normalize_math_record(r)
+            nr = _normalize_numglue_record(r)
             if nr is not None and isinstance(nr.get("instruction",""), str):
                 test_records.append(nr)
             else:
@@ -495,16 +420,6 @@ def _load_numglue_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[st
         raise RuntimeError("[NumGLUE] No usable rows in test.json")
 
     return train_records, test_records
-
-def _split_train_val(records: List[Dict[str, Any]], val_ratio: float = 0.1, seed: int = _SPLIT_SEED) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    rng = random.Random(seed)
-    idx = list(range(len(records)))
-    rng.shuffle(idx)
-    cut = max(1, int(len(idx) * (1.0 - val_ratio)))
-    train_idx, val_idx = idx[:cut], idx[cut:]
-    train = [records[i] for i in train_idx]
-    val = [records[i] for i in val_idx]
-    return train, val
 
 # ───────────────────────── Formatting helpers ───────────────────────── #
 _BOOL_TRUE = {"true","1","yes","y"}
@@ -622,7 +537,7 @@ def _parse_answer_format(instr: str) -> Optional[Tuple[str,int]]:
     return (pref, K)
 
 def _task_defaults(dsname: str) -> Tuple[str, Optional[int]]:
-    reg = COMMONSENSE_REGISTRY.get(dsname) or MATH_REGISTRY.get(dsname) or {}
+    reg = COMMONSENSE_REGISTRY.get(dsname) or {}
     kind = reg.get("kind")
     if kind == "bool":
         return ("bool", 2)
@@ -971,17 +886,11 @@ if tok.pad_token is None:
 # ─────────────────────── Load & build datasets ─────────────────────── #
 if is_numglue:
     tr_recs, te_recs = _load_numglue_train_test(args.dataset_root, task_name)
-    train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
-    val_dataset   = build_hf_dataset(te_recs, task_name, args.max_length, tok)
-elif is_commonsense:
-    tr_recs, te_recs = _load_commonsense_train_test(args.dataset_root, task_name)
-    train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
-    val_dataset   = build_hf_dataset(te_recs, task_name, args.max_length, tok)
 else:
-    all_records = _load_task_records_from_dir(args.dataset_root, task_name)
-    tr_recs, va_recs = _split_train_val(all_records, val_ratio=0.1, seed=_SPLIT_SEED)
-    train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
-    val_dataset   = build_hf_dataset(va_recs, task_name, args.max_length, tok)
+    tr_recs, te_recs = _load_commonsense_train_test(args.dataset_root, task_name)
+
+train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
+val_dataset   = build_hf_dataset(te_recs, task_name, args.max_length, tok)
 
 _check_lengths(train_dataset, "train_dataset")
 _check_lengths(val_dataset,   "val_dataset")
@@ -990,11 +899,7 @@ train_val = DatasetDict({"train": train_dataset, "validation": val_dataset})
 # ─────────────────────── Step 3.1: compute forced scheme ───────────────────── #
 from local_model_utilities import make_forced_labels_scheme
 
-if is_math:
-    combined_for_scheme = tr_recs + va_recs
-else:
-    combined_for_scheme = tr_recs + te_recs
-
+combined_for_scheme = tr_recs + te_recs
 prefix_used, K_used = _prefix_and_K_from_records_or_defaults(combined_for_scheme, task_name)
 
 # Prefer enumerated labels if present in any record's instruction
@@ -1116,7 +1021,6 @@ def modify_model_for_gasdu(
         pass
 
     modified_layers: list[str] = []
-
     for p in model.parameters(): 
         p.requires_grad = False
 
@@ -1242,21 +1146,15 @@ class ThroughputMeter(Callback):
 
 # ───── Per-step median grad-norm proportion logger (GASDU layers only) ──── #
 class GradRatioLogger(Callback):
-    """
-    After backward (before optimizer step) compute the **median** grad-norm proportion
-    across all SparseUpdateLinear modules and log to file.
-    """
     def __init__(self, path: Optional[str], enabled: bool):
         self.path = path
         self.enabled = bool(enabled)
-
     def on_fit_start(self, trainer, pl_module):
         if not (self.enabled and self.path): return
         if getattr(trainer, "is_global_zero", True):
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 f.write("step\tmedian_grad_ratio\n")
-
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         if not (self.enabled and self.path): return
         if not getattr(trainer, "is_global_zero", True): return
@@ -1322,15 +1220,10 @@ def stage1_grid_search():
                 )
 
                 lit = CustomLightningModule(
-                    math_numeric_eval=(is_math or is_numglue),
+                    math_numeric_eval=is_numglue,   # EM-style numeric eval for NumGLUE
                     max_gen_new_tokens=32,
                     model=model_ft, tokenizer=tok, learning_rate=lr, task_name=task_name, forced_scheme=forced_scheme,
-                    # SFT not used in GASDU
-                    sft_enabled=False,
-                    sft_use_sm3=False,
-                    sft_total_train_steps=None,
-                    sft_grad_accum=1,
-                    sft_peft_config=None,
+                    sft_enabled=False, sft_use_sm3=False, sft_total_train_steps=None, sft_grad_accum=1, sft_peft_config=None,
                 )
 
                 ds_tr = GenericDataset(train_val, "train")
@@ -1369,7 +1262,7 @@ def stage1_grid_search():
                 peak_gb = _peak_gpu_gb()
 
                 val_best = best_cb.best if best_cb.best is not None else 0.0
-                val_score = float(val_best) * 100.0  # % EM on NumGLUE
+                val_score = float(val_best) * 100.0  # % EM on NumGLUE (or accuracy for commonsense)
                 train_sps = tp_meter.samples_per_sec
 
                 f.write(f"{lr:.8g}\t{bs}\t{val_score:.4f}\t{avg_epoch_min:.3f}\t{peak_gb:.3f}\t{train_sps:.3f}\n"); f.flush()
@@ -1434,14 +1327,10 @@ with open(STAGE2_PATH, "w", encoding="utf-8") as f2:
         ).to(device)
 
         lit = CustomLightningModule(
-            math_numeric_eval=(is_math or is_numglue),
+            math_numeric_eval=is_numglue,
             max_gen_new_tokens=32,
             model=model_ft, tokenizer=tok, learning_rate=best_lr, task_name=task_name, forced_scheme=forced_scheme,
-            sft_enabled=False,
-            sft_use_sm3=False,
-            sft_total_train_steps=None,
-            sft_grad_accum=1,
-            sft_peft_config=None,
+            sft_enabled=False, sft_use_sm3=False, sft_total_train_steps=None, sft_grad_accum=1, sft_peft_config=None,
         )
 
         ds_tr = GenericDataset(train_val, "train")
@@ -1489,7 +1378,7 @@ with open(STAGE2_PATH, "w", encoding="utf-8") as f2:
         peak_gb = _peak_gpu_gb()
 
         best_val_seed = best_cb.best if best_cb.best is not None else 0.0
-        val_score = float(best_val_seed) * 100.0  # % EM on NumGLUE
+        val_score = float(best_val_seed) * 100.0  # % EM on NumGLUE (or accuracy for commonsense)
         print(f"seed={sd} ⇒ EM={val_score:.2f}%   (time: {elapsed:.1f} min)")
 
         train_sps = tp_meter.samples_per_sec
