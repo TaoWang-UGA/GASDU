@@ -1,10 +1,11 @@
-# train.py
-# — Instruction-style local dataset loading from dataset/<task>/*
-# No internet calls. Supports .json / .jsonl (optionally .gz).
-# Deterministic split (90/10) for regular tasks; for NumGLUE (Type1–Type8),
-# we use train.json for training and test.json for evaluation (Exact Match metric).
+# train.py — GASDU-only fine-tuning on local datasets
+# - No internet calls. Supports .json / .jsonl (optionally .gz).
+# - Commonsense tasks now use train.json (train) and test.json (validation),
+#   mirroring the NumGLUE behavior.
+# - Math tasks keep the original behavior:
+#     *_*_1.json + test.json collected and split 90/10 deterministically.
 #
-# Assumed instruction-style records:
+# Assumed instruction-style records (for commonsense & many math/NumGLUE):
 #   { "instruction": str, "input": str, "output": str, "answer": str }
 # We parse "Answer format:" and normalize to a discriminative label set so the
 # FIRST supervised token is unique per class (important for accuracy).
@@ -14,7 +15,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-import argparse, os, sys, time, random, shutil, subprocess, gzip, json, io, re, glob, math
+import argparse, os, sys, time, random, gzip, json, io, re, glob
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import torch.nn as nn
@@ -25,7 +26,7 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import Dataset as HFDataset, DatasetDict
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# GASDU sparse-update layer
+# --- GASDU layer ---
 from gasdu import SparseUpdateLinear
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -86,7 +87,7 @@ TASK_FOLDER_MAP: Dict[str, str] = {
 }
 
 # ─────────────────────────────── CLI ─────────────────────────────── #
-parser = argparse.ArgumentParser(description="Fine-tune LLM on a single dataset loaded from dataset/<task>/*.json")
+parser = argparse.ArgumentParser(description="GASDU fine-tuning on a single local dataset")
 parser.add_argument("task_name", type=str, help="Dataset name (commonsense, math subtask, or NumGLUE type).")
 parser.add_argument("--dataset_root", type=str, default="dataset", help="Root folder containing task subfolders.")
 parser.add_argument("--model_name", default="meta-llama/Meta-Llama-3-8B", help="HF model path or id.")
@@ -99,31 +100,12 @@ parser.add_argument("--learning_rate", type=float, default=5e-5)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--stage1_only", action="store_true")
 parser.add_argument("--stage2_only", action="store_true")
-
-# GASDU only
-parser.add_argument("--finetune_method", default="gasdu", choices=["gasdu"])
-
-# legacy/unused knobs kept for compatibility (no-ops under GASDU)
-parser.add_argument("--lora_rank", type=int, default=21)
-parser.add_argument("--lora_alpha", type=float, default=1.0)
-
 parser.add_argument("--mask_mode", default="topk", choices=["topk", "bernoulli", "fixed_topk", "topk_refresh_each_step"])
 parser.add_argument("--track_grad_norm_prop", action="store_true")
 parser.add_argument("--full_grad_every", type=int, default=50)
-
-# legacy SFT args preserved (ignored when method != 'sft')
-parser.add_argument("--sft_selection", type=str, default="rigl", choices=["rigl", "sm3"],
-                    help="(unused under GASDU) Algorithm for SFT candidate selection.")
-parser.add_argument("--sft_reselection_steps", type=int, default=20,
-                    help="(unused under GASDU) Reselection period.")
-parser.add_argument("--sft_selection_accumulation_steps", type=int, default=5,
-                    help="(unused under GASDU) Accum steps.")
-parser.add_argument("--sft_optimizer", type=str, default="adamw", choices=["adamw", "sm3"],
-                    help="(unused under GASDU) SFT optimizer.")
 parser.add_argument("--stage2_seeds", type=str, default="",
                     help="Optional comma-separated list of seeds for Stage-2 (e.g., '42' or '42,43,233'). "
                          "If empty, use default [42, 43, 233].")
-
 args = parser.parse_args()
 
 task_name_raw = args.task_name
@@ -150,16 +132,13 @@ def is_numglue_task(name: str) -> bool:
 
 def _resolve_numglue_folder(dataset_root: str, name: str) -> str:
     """
-    Resolve NumGLUE Type folders to the new flat layout:
+    Resolve NumGLUE Type folders to the flat layout:
       • dataset/Type_1, dataset/Type_2, ..., dataset/Type_8
-    We no longer consider 'NumGLUE/TypeX' or any other paths.
     """
-    # If the user passed an actual folder name (e.g., "Type_1"), honor it.
     direct = os.path.join(dataset_root, TASK_FOLDER_MAP.get(name, name))
     if os.path.isdir(direct):
         return direct
 
-    # Normalize alias -> type number
     tnum = None
     if name in _NUMGLUE_ALIASES:
         tnum = _NUMGLUE_ALIASES[name]
@@ -173,18 +152,15 @@ def _resolve_numglue_folder(dataset_root: str, name: str) -> str:
         if os.path.isdir(c):
             return c
 
-    # Last resort: treat 'name' as a folder directly under dataset/
     fallback = os.path.join(dataset_root, name)
     if os.path.isdir(fallback):
         return fallback
 
-    # If we get here, we didn't find a valid folder
     raise FileNotFoundError(
         f"[NumGLUE] Could not resolve folder for '{name}'. "
         f"Expected: {os.path.join(dataset_root, 'Type_1')} ... {os.path.join(dataset_root, 'Type_8')} "
         f"or an existing folder named '{name}' under {dataset_root}."
     )
-
 
 is_commonsense = task_name in COMMONSENSE_REGISTRY
 is_math = task_name in MATH_REGISTRY
@@ -197,12 +173,9 @@ if not (is_commonsense or is_math or is_numglue):
     )
 
 # ─────────────────────────── Output dirs ─────────────────────────── #
-method_tag = args.finetune_method
+method_tag = "gasdu"
 out_basename = os.path.basename(model_name).replace("/", "-")
-# For NumGLUE, include resolved type label in the directory for clarity
-_numglue_suffix = ""
-if is_numglue:
-    _numglue_suffix = f"_numglue"
+_numglue_suffix = "_numglue" if is_numglue else ""
 out_dir = f"./GASDU_{task_name}{_numglue_suffix}_{out_basename}_{method_tag}_{args.mask_mode}"
 os.makedirs(out_dir, exist_ok=True)
 logs_dir = os.path.join(out_dir, "logs")
@@ -212,7 +185,7 @@ os.makedirs(logs_dir, exist_ok=True)
 def set_random_seed(sd: int):
     random.seed(sd); np.random.seed(sd)
     torch.manual_seed(sd); torch.cuda.manual_seed_all(sd)
-_SPLIT_SEED = 137  # fixed seed for deterministic 90/10 train/val splits (non-NumGLUE)
+_SPLIT_SEED = 137  # fixed seed for deterministic 90/10 train/val splits (for math)
 
 # ─────────────────────── GPU pick (simple) ─────────────────────── #
 def _pick_gpu_with_lowest_mem():
@@ -241,7 +214,6 @@ def _pick_gpu_with_lowest_mem():
         except Exception:
             return 0
 
-    # If a single device is visible, it's always local 0.
     try:
         n = torch.cuda.device_count()
         if n >= 1:
@@ -309,41 +281,23 @@ def _load_single_json_like(path: str) -> List[Dict[str, Any]]:
         return out
 
 # ───────────────────── Math/NumGLUE normalization helpers ─────────────────── #
-
 def _coerce_answer_to_str(x: Any) -> str:
-    """Turn numeric/bool/etc into a clean string (e.g., 43.0 -> '43')."""
     if isinstance(x, bool):
         return "true" if x else "false"
-    if isinstance(x, (int,)):
+    if isinstance(x, int):
         return str(x)
     if isinstance(x, float):
-        if abs(x - round(x)) < 1e-12:
-            return str(int(round(x)))
-        return str(x)
+        from math import isclose
+        return str(int(round(x))) if isclose(x, round(x), abs_tol=1e-12) else str(x)
     return str(x).strip()
 
 def _normalize_math_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Normalize a single record to instruction-style:
-        {instruction, input, output, answer}
-    Accepts either native instruction-style or the '*_1.json' schema:
-        {
-          "question": str,
-          "chain-of-thought": str (optional),
-          "pred": number (optional),
-          "answer": number/str
-          ... (e.g., SVAMP may have extra fields like "ID")
-        }
-    Also robust for NumGLUE where common fields are {question, rationale?, answer}.
-    """
-    # Already instruction-style? Ensure required keys and return.
+    # Already instruction-style?
     if isinstance(rec.get("instruction", None), str):
         ins = rec["instruction"].strip()
-        if not ins:
-            return None
+        if not ins: return None
         ans = rec.get("answer", None)
-        if ans is None:
-            return None
+        if ans is None: return None
         out = rec.get("output", "")
         return {
             "instruction": ins,
@@ -352,13 +306,11 @@ def _normalize_math_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "answer": _coerce_answer_to_str(ans),
         }
 
-    # Generic normalization path (Math/NumGLUE): must have question & answer
     q = rec.get("question", None)
     a = rec.get("answer", None)
     if not isinstance(q, str) or a is None:
         return None
 
-    # Try to collect any reasoning/rationale field (various names appear in the wild)
     cot = rec.get("chain-of-thought", rec.get("rationale", rec.get("solution", "")))
     return {
         "instruction": q.strip(),
@@ -368,12 +320,6 @@ def _normalize_math_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 def _list_math_candidate_files(root: str) -> List[str]:
-    """
-    Only include the two families we want:
-      - *_1.json(.gz/.jsonl/.jsonl.gz)
-      - test.json(.gz/.jsonl/.jsonl.gz)
-    Ignore anything else like addsub.json, svamp.json, etc.
-    """
     pats = [
         "**/*_1.json", "**/*_1.json.gz", "**/*_1.jsonl", "**/*_1.jsonl.gz",
         "**/test.json", "**/test.json.gz", "**/test.jsonl", "**/test.jsonl.gz",
@@ -384,37 +330,22 @@ def _list_math_candidate_files(root: str) -> List[str]:
     return sorted(set(files))
 
 def _load_task_records_from_dir(dataset_root: str, task: str) -> List[Dict[str, Any]]:
-    """
-    Load ONLY from dataset/<task>:
-      • for MATH tasks: *_1.json + test.json (and their .jsonl/.jsonl.gz variants),
-        normalizing all rows to instruction-style.
-      • for non-MATH (commonsense) tasks: keep your original behavior
-        (any .json/.jsonl/.gz), but require instruction-style.
-      • NumGLUE is handled separately (see _load_numglue_train_test).
-    """
     folder = TASK_FOLDER_MAP.get(task, task)
     root = os.path.join(dataset_root, folder)
     if not os.path.isdir(root):
         raise FileNotFoundError(f"Task folder not found: {root}")
 
     is_math_task = task in MATH_REGISTRY
-
     if is_math_task:
         files = _list_math_candidate_files(root)
     else:
-        patterns = ["**/*.json", "**/*.jsonl", "**/*.json.gz", "**/*.jsonl.gz"]
-        files: List[str] = []
-        for pat in patterns:
-            files.extend(glob.glob(os.path.join(root, pat), recursive=True))
-        files = sorted(set(files))
+        # not used for commonsense anymore
+        files = []
 
-    if not files:
-        if is_math_task:
-            raise RuntimeError(
-                f"No candidate files (*_1.json / test.json) found for math task '{task}' under {root}"
-            )
-        else:
-            raise RuntimeError(f"No .json/.jsonl files found under {root}")
+    if is_math_task and not files:
+        raise RuntimeError(
+            f"No candidate files (*_1.json / test.json) found for math task '{task}' under {root}"
+        )
 
     records: List[Dict[str, Any]] = []
     bad_files = 0
@@ -426,34 +357,87 @@ def _load_task_records_from_dir(dataset_root: str, task: str) -> List[Dict[str, 
                     nr = _normalize_math_record(r)
                     if nr is not None and isinstance(nr.get("instruction", ""), str):
                         records.append(nr)
-                else:
-                    # commonsense path expects instruction-style already
-                    if isinstance(r, dict) and isinstance(r.get("instruction",""), str):
-                        records.append(r)
         except Exception:
             bad_files += 1
             continue
 
     if bad_files:
         print(f"[DATA] Warning: {bad_files} files failed to load under {root}")
-    if not records:
-        raise RuntimeError(f"No usable records for task '{task}' from {root}")
+    if is_math_task and not records:
+        raise RuntimeError(f"No usable records for math task '{task}' from {root}")
 
     return records
 
+# ─────────────────── Generic train/test loader (commonsense) ───────────────── #
+def _load_commonsense_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    For commonsense tasks:
+      - Directly load train.json and test.json inside the task folder.
+      - Expect instruction-style rows; skip malformed rows.
+    """
+    folder = TASK_FOLDER_MAP.get(task, task)
+    base = os.path.join(dataset_root, folder)
+    if not os.path.isdir(base):
+        raise FileNotFoundError(f"[Commonsense] Folder not found: {base}")
+
+    def _first_existing(paths: List[str]) -> Optional[str]:
+        for p in paths:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    train_fp_candidates = [
+        os.path.join(base, "train.json"),
+        os.path.join(base, "train.jsonl"),
+        os.path.join(base, "train.json.gz"),
+        os.path.join(base, "train.jsonl.gz"),
+    ]
+    test_fp_candidates = [
+        os.path.join(base, "test.json"),
+        os.path.join(base, "test.jsonl"),
+        os.path.join(base, "test.json.gz"),
+        os.path.join(base, "test.jsonl.gz"),
+    ]
+    tr_path = _first_existing(train_fp_candidates)
+    te_path = _first_existing(test_fp_candidates)
+    if tr_path is None or te_path is None:
+        raise FileNotFoundError(
+            f"[Commonsense] Missing required files. train.json present? {tr_path is not None}; test.json present? {te_path is not None}. "
+            f"Looked under: {base}"
+        )
+
+    tr_raw = _load_single_json_like(tr_path)
+    te_raw = _load_single_json_like(te_path)
+
+    def _keep_instruction_style(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out = []
+        for r in rows:
+            if isinstance(r, dict) and isinstance(r.get("instruction", ""), str):
+                out.append({
+                    "instruction": r["instruction"],
+                    "input": "" if r.get("input") is None else str(r.get("input")),
+                    "output": "" if r.get("output") is None else str(r.get("output")),
+                    "answer": _coerce_answer_to_str(r.get("answer", "")),
+                })
+        return out
+
+    train_records = _keep_instruction_style(tr_raw)
+    test_records  = _keep_instruction_style(te_raw)
+    if not train_records: raise RuntimeError("[Commonsense] No usable rows in train.json")
+    if not test_records:  raise RuntimeError("[Commonsense] No usable rows in test.json")
+    return train_records, test_records
+
 # ──────────────────────── NumGLUE: direct train/test I/O ─────────────────────── #
 def _load_numglue_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    For NumGLUE Type1–Type8:
-      - Directly load train.json (training) and test.json (evaluation)
-      - Normalize to instruction-style via _normalize_math_record
-      - No random split; evaluation uses Exact Match (EM)
-    """
     folder = _resolve_numglue_folder(dataset_root, task)
     if not os.path.isdir(folder):
-        raise FileNotFoundError(
-            f"[NumGLUE] Could not resolve dataset folder for '{task}'. Tried '{folder}'."
-        )
+        raise FileNotFoundError(f"[NumGLUE] Could not resolve dataset folder for '{task}'. Tried '{folder}'.")
+
+    def _first_existing(paths: List[str]) -> Optional[str]:
+        for p in paths:
+            if os.path.isfile(p):
+                return p
+        return None
 
     train_fp_candidates = [
         os.path.join(folder, "train.json"),
@@ -467,13 +451,6 @@ def _load_numglue_train_test(dataset_root: str, task: str) -> Tuple[List[Dict[st
         os.path.join(folder, "test.json.gz"),
         os.path.join(folder, "test.jsonl.gz"),
     ]
-
-    def _first_existing(paths: List[str]) -> Optional[str]:
-        for p in paths:
-            if os.path.isfile(p):
-                return p
-        return None
-
     tr_path = _first_existing(train_fp_candidates)
     te_path = _first_existing(test_fp_candidates)
     if tr_path is None or te_path is None:
@@ -534,29 +511,20 @@ _BOOL_TRUE = {"true","1","yes","y"}
 _BOOL_FALSE = {"false","0","no","n"}
 
 def _prefix_and_K_from_records_or_defaults(records, dsname) -> Tuple[str, Optional[int]]:
-    """
-    Decide training label scheme by *observing* the data first.
-    Returns:
-      ('bool', 2) or ('open', None) or (prefix, K) for MC.
-    """
-    # Commonsense hard-booleans stay boolean
     reg = COMMONSENSE_REGISTRY.get(dsname, {})
     if reg.get("kind") == "bool":
         return "bool", 2
 
-    # Try to detect explicit Answer format lines in any instruction
     for rec in records:
         instr = rec.get("instruction", "")
         fmt = _parse_answer_format(instr)
         if fmt:
             if fmt[0] == "bool":
                 return "bool", 2
-            # we don't force numeric here; stay open unless MC/Bool
             prefix, K = fmt
             if isinstance(K, int) and K >= 2:
                 return prefix, K
 
-    # If any answer looks like answer/solution/ending/option<number>, assume MC
     mc_prefixes = ["answer", "solution", "ending", "option"]
     max_idx = 0
     chosen_prefix = None
@@ -567,14 +535,11 @@ def _prefix_and_K_from_records_or_defaults(records, dsname) -> Tuple[str, Option
         for p in mc_prefixes:
             m = re.search(rf"\b{re.escape(p)}\s*([1-9][0-9]*)\b", ans.lower())
             if m:
-                idx = int(m.group(1))
+                idx = int(m.group(1)); 
                 if idx > max_idx:
-                    max_idx = idx
-                    chosen_prefix = p
+                    max_idx = idx; chosen_prefix = p
     if chosen_prefix and max_idx >= 2:
         return chosen_prefix, max_idx
-
-    # Otherwise: treat as open, even for AQuA (some drops are open-ended)
     return "open", None
 
 def _extract_bool_answer(ex: Dict[str, Any]) -> Optional[bool]:
@@ -616,19 +581,16 @@ def _extract_indexed_answer(ex: Dict[str, Any], prefixes: List[str]) -> Optional
         if last: return last
     return None
 
-# ── PATCH: Ellipsis-tolerant parser + numeric-aware
 def _parse_answer_format(instr: str) -> Optional[Tuple[str,int]]:
     if not isinstance(instr, str): return None
     m = re.search(r"answer\s*format\s*:\s*(.+)", instr, re.I|re.S)
     if not m: return None
     tail = m.group(1).strip()
-    tail = tail.splitlines()[0]  # only first line after "Answer format:"
+    tail = tail.splitlines()[0]
 
-    # Quick numeric signal
     if re.search(r"\b(?:a\s+)?(?:number|numeric|integer|float|decimal)\b", tail, re.I):
         return ("numeric", 0)
 
-    # Split by '/', ',' or ';'; drop ellipses
     raw_parts = re.split(r"[\/,;]", tail)
     parts: List[str] = []
     for x in raw_parts:
@@ -640,11 +602,9 @@ def _parse_answer_format(instr: str) -> Optional[Tuple[str,int]]:
     if not parts:
         return None
 
-    # Boolean special case
     if all(re.fullmatch(r"(true|false)", p, re.I) for p in parts) and len(parts) == 2:
         return ("bool", 2)
 
-    # MC like "Option 1 / Option 2 / ..."
     pref = None
     idxs: List[int] = []
     for p in parts:
@@ -707,39 +667,25 @@ def _ensure_prompt_matches_labels(instr: str, labels: List[str]) -> str:
 
 def _append_answer_stub(instr: str) -> str:
     s = instr.rstrip()
-    if s.endswith("Answer:"):
-        return s + " "
-    else:
-        return s + "\nAnswer: "
+    return s + " " if s.endswith("Answer:") else s + "\nAnswer: "
 
-# ── NEW: Enumerated word labels (e.g., entailment/contradiction/neutral)
 def _extract_enumerated_labels(instr: str) -> Optional[List[str]]:
-    """
-    Parse 'Answer format: entailment/contradiction/neutral' style word lists.
-    Returns lower-cased labels if 2..10 items are found; otherwise None.
-    Skips '...', '…', 'etc', 'etc.'.
-    """
     if not isinstance(instr, str):
         return None
     m = re.search(r"answer\s*format\s*:\s*(.+)", instr, re.I | re.S)
     if not m:
         return None
     tail = m.group(1).strip().splitlines()[0]
-
-    # If explicitly numeric or boolean, delegate to other branches
     if re.search(r"\b(?:a\s+)?(?:number|numeric|integer|float|decimal)\b", tail, re.I):
         return None
     if re.search(r"\btrue\b", tail, re.I) and re.search(r"\bfalse\b", tail, re.I):
         return None
-
     parts = [p.strip() for p in re.split(r"[\/,;]", tail) if p.strip()]
     parts = [p for p in parts if p not in {"...", "…", "etc", "etc."}]
     if not (2 <= len(parts) <= 10):
         return None
-
     clean = []
     for p in parts:
-        # Allow letters, spaces, hyphens, underscores (e.g., "not-entailment")
         if re.fullmatch(r"[A-Za-z][A-Za-z _\-]*", p):
             clean.append(p.lower().strip())
         else:
@@ -747,23 +693,14 @@ def _extract_enumerated_labels(instr: str) -> Optional[List[str]]:
     return clean if clean else None
 
 def _ensure_discriminative_from_list(tok, labels: List[str]) -> List[str]:
-    """
-    Turn a provided string label list into training targets with unique first tokens.
-    Prefer the words themselves; if first tokens collide, fall back to A/B/C...
-    """
     labs = [" " + l.strip() for l in labels]
     fids = [_first_token_id(tok, lab) for lab in labs]
     if None not in fids and len(set(fids)) == len(labs):
         return labs
-    # fallback
     K = len(labels)
     return [f" {L}" for L in list("ABCDE")[:K]]
 
 def _extract_enum_answer(ex: Dict[str, Any], allowed: List[str]) -> Optional[int]:
-    """
-    Map gold answer to index in 'allowed' (case-insensitive substring match).
-    Prefer 'answer' field; fall back to 'output'. Use last occurrence if multiple.
-    """
     def find(s: str) -> Optional[int]:
         s_low = s.lower()
         hit = None
@@ -784,21 +721,18 @@ def _extract_enum_answer(ex: Dict[str, Any], allowed: List[str]) -> Optional[int
             return idx
     return None
 
-# ── Build prompt & targets ─────────────────────────────────────────────────── #
 def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: int, tok):
     instr = str(example.get("instruction","")).strip()
     if not instr: return None
     instr = re.sub(r"\n{3,}", "\n\n", instr)
 
-    # 1) Try explicit "Answer format:" first
     fmt = _parse_answer_format(instr)
 
-    # 1a) Numeric explicit format → open-form numeric; KEEP the 'Answer format' line
     if fmt and fmt[0] == "numeric":
         ans = example.get("answer", example.get("output", ""))
         if ans is None: return None
         answer_text = " " + str(ans).strip()
-        prompt = _append_answer_stub(instr)  # keep numeric hint in the prompt
+        prompt = _append_answer_stub(instr)
 
         prompt_ids = tok.encode(prompt, add_special_tokens=False)
         answer_ids = tok.encode(answer_text, add_special_tokens=False)
@@ -816,7 +750,6 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
         attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
         return input_ids, labels, attention_mask
 
-    # 1b) Boolean explicit format
     if fmt and fmt[0] == "bool":
         tf = _extract_bool_answer(example)
         if tf is None: return None
@@ -840,15 +773,13 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
         attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
         return input_ids, labels, attention_mask
 
-    # 1c) Enumeration of word labels (e.g., entailment/contradiction/neutral)
     enum_labels = _extract_enumerated_labels(instr) if not (fmt and fmt[0] in ("bool", "numeric")) else None
     if enum_labels:
         idx = _extract_enum_answer(example, enum_labels)
         if idx is None:
-            # open fallback for this record
             ans = example.get("answer", example.get("output", ""))
             if ans is None: return None
-            prompt = _append_answer_stub(instr)  # keep the 'Answer format' line for clarity
+            prompt = _append_answer_stub(instr)
             answer_text = " " + str(ans).strip()
             prompt_ids = tok.encode(prompt, add_special_tokens=False)
             answer_ids = tok.encode(answer_text, add_special_tokens=False)
@@ -866,7 +797,6 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
             attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
             return input_ids, labels, attention_mask
 
-        # Use the words themselves if their first tokens are unique, else fall back to A/B/C...
         labels_set = _ensure_discriminative_from_list(tok, enum_labels)
         instr = _ensure_prompt_matches_labels(instr, labels_set)
         answer_text = labels_set[idx]
@@ -887,13 +817,11 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
         attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
         return input_ids, labels, attention_mask
 
-    # 2) If explicit format says MC (prefix+number), honor it
     if fmt and fmt[0] not in ("bool", "numeric"):
         prefix, K = fmt
         pair = _extract_indexed_answer(example, prefixes=[prefix]) or \
                _extract_indexed_answer(example, prefixes=["answer","solution","ending","option"])
         if pair is None:
-            # cannot map to an index → open fallback for THIS record (strip MC hint)
             ans = example.get("answer", example.get("output", ""))
             if ans is None: return None
             instr_open = re.sub(r"(?im)^.*\banswer\s*format\s*:\s*.*$", "", instr).strip()
@@ -939,7 +867,6 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
         attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
         return input_ids, labels, attention_mask
 
-    # 3) No explicit format — fall back to task defaults & inference
     default_prefix, default_K = _task_defaults(dsname)
 
     if default_prefix == "bool":
@@ -965,7 +892,6 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
         attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
         return input_ids, labels, attention_mask
 
-    # Try to infer MC even without "Answer format:"
     pair = _extract_indexed_answer(example, prefixes=["answer","solution","ending","option"])
     if pair is not None:
         _, idx = pair
@@ -990,7 +916,6 @@ def _build_prompt_and_answer(example: Dict[str, Any], dsname: str, max_length: i
         attention_mask = [1 if t != tok.pad_token_id else 0 for t in input_ids]
         return input_ids, labels, attention_mask
 
-    # Finally, open-form fallback
     ans = example.get("answer", example.get("output", ""))
     if ans is None: return None
     answer_text = " " + str(ans).strip()
@@ -1045,12 +970,14 @@ if tok.pad_token is None:
 
 # ─────────────────────── Load & build datasets ─────────────────────── #
 if is_numglue:
-    # Direct train/test usage for NumGLUE
     tr_recs, te_recs = _load_numglue_train_test(args.dataset_root, task_name)
     train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
     val_dataset   = build_hf_dataset(te_recs, task_name, args.max_length, tok)
+elif is_commonsense:
+    tr_recs, te_recs = _load_commonsense_train_test(args.dataset_root, task_name)
+    train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
+    val_dataset   = build_hf_dataset(te_recs, task_name, args.max_length, tok)
 else:
-    # Original behavior: load from folder and split 90/10
     all_records = _load_task_records_from_dir(args.dataset_root, task_name)
     tr_recs, va_recs = _split_train_val(all_records, val_ratio=0.1, seed=_SPLIT_SEED)
     train_dataset = build_hf_dataset(tr_recs, task_name, args.max_length, tok)
@@ -1061,18 +988,18 @@ _check_lengths(val_dataset,   "val_dataset")
 train_val = DatasetDict({"train": train_dataset, "validation": val_dataset})
 
 # ─────────────────────── Step 3.1: compute forced scheme ───────────────────── #
-# Decide scheme from actual data (can make AQuA/NumGLUE open if needed)
-prefix_used, K_used = _prefix_and_K_from_records_or_defaults(
-    (tr_recs + (te_recs if is_numglue else va_recs)),
-    task_name
-)
-
 from local_model_utilities import make_forced_labels_scheme
 
+if is_math:
+    combined_for_scheme = tr_recs + va_recs
+else:
+    combined_for_scheme = tr_recs + te_recs
+
+prefix_used, K_used = _prefix_and_K_from_records_or_defaults(combined_for_scheme, task_name)
+
 # Prefer enumerated labels if present in any record's instruction
-_combined = (tr_recs + (te_recs if is_numglue else va_recs))
 enum_forced = None
-for _rec in _combined:
+for _rec in combined_for_scheme:
     _instr = _rec.get("instruction", "")
     _enum = _extract_enumerated_labels(_instr)
     if _enum:
@@ -1150,15 +1077,15 @@ def _print_modified_layers(modified: list[str], tag: str = ""):
     if not modified:
         print(f"[FT]{f'[{tag}]' if tag else ''} No layers were wrapped/replaced.")
         return
-    cap = int(os.getenv("GODLU_LOG_LAYER_MAX", "24"))  # kept for backward compat
+    cap = int(os.getenv("GASDU_LOG_LAYER_MAX", "24"))
     print(f"[FT]{f'[{tag}]' if tag else ''} Wrapped/replaced {len(modified)} layers:")
     for line in modified[:cap]:
         print("   •", line)
     if len(modified) > cap:
-        print(f"   • ... (+{len(modified)-cap} more). Set GODLU_LOG_LAYER_MAX to view all.")
+        print(f"   • ... (+{len(modified)-cap} more). Set GASDU_LOG_LAYER_MAX to view all.")
 
 # ───────────────── Checkpointing policy (centralized) ───────────────── #
-def apply_checkpointing_policy(base, method: str):
+def apply_checkpointing_policy(base):
     try:
         base.config.use_cache = False
     except Exception:
@@ -1171,30 +1098,27 @@ def apply_checkpointing_policy(base, method: str):
         base.gradient_checkpointing_enable()
     except Exception:
         pass
-    if method in ("gasdu",) and hasattr(base, "enable_input_require_grads"):
+    if hasattr(base, "enable_input_require_grads"):
         base.enable_input_require_grads()
 
-def modify_model_for_finetuning(
+def modify_model_for_gasdu(
     model, *,
     k_val: Optional[int] = None,
     update_percent: float = 0.1,
     use_dynamic_k: bool = False,
-    method: str = "gasdu",
-    lora_rank: int = 32,     # unused under GASDU
-    lora_alpha: float = 32,  # unused under GASDU
     mask_mode: str = "topk",
     track_grad_norm_prop: bool = False,
     full_grad_every: int = 5
 ):
     try:
-        apply_checkpointing_policy(model, method)
+        apply_checkpointing_policy(model)
     except Exception:
         pass
 
     modified_layers: list[str] = []
 
-    # GASDU only (formerly GODLU)
-    for p in model.parameters(): p.requires_grad = False
+    for p in model.parameters(): 
+        p.requires_grad = False
 
     if hasattr(model, "layers"):
         candidate_layers = model.layers
@@ -1208,48 +1132,44 @@ def modify_model_for_finetuning(
     proj_names = ("q_proj", "k_proj", "v_proj", "o_proj")
     num_proj_layers = _count_proj_layers(model, proj_names=proj_names)
 
-    if method == "gasdu":
-        if k_val is None:
-            total_params = sum(p.numel() for p in model.parameters())
-            params_to_update = int(total_params * (update_percent / 100.0))
-            k_val = max(1, params_to_update // max(1, num_proj_layers))
+    if k_val is None:
+        total_params = sum(p.numel() for p in model.parameters())
+        params_to_update = int(total_params * (update_percent / 100.0))
+        k_val = max(1, params_to_update // max(1, num_proj_layers))
 
-        def gasdu_layer(old_linear: nn.Linear) -> nn.Module:
-            return make_sparse_from_linear(
-                old_linear,
-                k               = k_val,
-                full_grad_every = full_grad_every,
-                mask_mode       = mask_mode,
-                track_grad_norm_prop = track_grad_norm_prop,
-                use_dynamic_k   = use_dynamic_k,
-                k_initial       = k_val,
-                k_final         = k_val,
+    def gasdu_layer(old_linear: nn.Linear) -> nn.Module:
+        return make_sparse_from_linear(
+            old_linear,
+            k               = k_val,
+            full_grad_every = full_grad_every,
+            mask_mode       = mask_mode,
+            track_grad_norm_prop = track_grad_norm_prop,
+            use_dynamic_k   = use_dynamic_k,
+            k_initial       = k_val,
+            k_final         = k_val,
+        )
+
+    for li, lyr in enumerate(candidate_layers):
+        if not hasattr(lyr, "self_attn"):
+            continue
+        for proj_name in proj_names:
+            if not hasattr(lyr.self_attn, proj_name):
+                continue
+            lin = getattr(lyr.self_attn, proj_name)
+            if lin is None:
+                continue
+            setattr(lyr.self_attn, proj_name, gasdu_layer(lin))
+            modified_layers.append(
+                f"{root_prefix}[{li}].self_attn.{proj_name} -> SparseUpdateLinear(k={k_val}, mode={mask_mode})"
             )
 
-        for li, lyr in enumerate(candidate_layers):
-            if not hasattr(lyr, "self_attn"):
-                continue
-            for proj_name in proj_names:
-                if not hasattr(lyr.self_attn, proj_name):
-                    continue
-                lin = getattr(lyr.self_attn, proj_name)
-                if lin is None:
-                    continue
-                setattr(lyr.self_attn, proj_name, gasdu_layer(lin))
-                modified_layers.append(
-                    f"{root_prefix}[{li}].self_attn.{proj_name} -> SparseUpdateLinear(k={k_val}, mode={mask_mode})"
-                )
-    else:
-        raise ValueError(f"Unknown finetune method: {method}")
-
     model.train()
-    _print_trainable_summary(model, method.upper())
+    _print_trainable_summary(model, "GASDU")
 
     setattr(model, "_ft_modified_layers", modified_layers)
-    _print_modified_layers(modified_layers, method.upper())
+    _print_modified_layers(modified_layers, "GASDU")
 
     return model
-
 
 # ───────────────────────── Lightning wrapper ───────────────────────── #
 from local_model_utilities import CustomLightningModule
@@ -1286,29 +1206,22 @@ class TrackBestValAcc(Callback):
             if (self.mode == "max" and v > self.best) or (self.mode == "min" and v < self.best):
                 self.best = v
 
-# ───── NEW: Training-only throughput meter (samples/sec over train steps) ───── #
+# ───── Training-only throughput meter (samples/sec over train steps) ───── #
 class ThroughputMeter(Callback):
-    """
-    Measures training-only throughput (samples/sec) by timing each *training* batch.
-    Includes forward+backward+optimizer step; excludes validation.
-    """
     def __init__(self, device=None):
         self.device = device
         self.total_samples = 0
         self.total_time = 0.0
         self._t0 = None
-
     def on_fit_start(self, trainer, pl_module):
         self.total_samples = 0
-               self.total_time = 0.0
+        self.total_time = 0.0
         self._t0 = None
-
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if self.device is not None and torch.cuda.is_available():
             try: torch.cuda.synchronize(self.device)
             except Exception: pass
         self._t0 = time.perf_counter()
-
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self._t0 is None:
             return
@@ -1323,12 +1236,11 @@ class ThroughputMeter(Callback):
         self.total_samples += bs
         self.total_time += dt
         self._t0 = None
-
     @property
     def samples_per_sec(self) -> float:
         return float(self.total_samples) / max(self.total_time, 1e-12)
 
-# ───── NEW: Per-step median grad-norm proportion logger (GASDU layers only) ──── #
+# ───── Per-step median grad-norm proportion logger (GASDU layers only) ──── #
 class GradRatioLogger(Callback):
     """
     After backward (before optimizer step) compute the **median** grad-norm proportion
@@ -1348,9 +1260,7 @@ class GradRatioLogger(Callback):
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         if not (self.enabled and self.path): return
         if not getattr(trainer, "is_global_zero", True): return
-
         model = getattr(pl_module, "model", pl_module)
-
         ratios: List[float] = []
         for m in model.modules():
             if isinstance(m, SparseUpdateLinear):
@@ -1360,7 +1270,6 @@ class GradRatioLogger(Callback):
                         ratios.append(float(r))
                     except Exception:
                         pass
-
         if ratios:
             med = float(np.median(ratios))
             with open(self.path, "a", encoding="utf-8") as f:
@@ -1380,17 +1289,16 @@ def _make_loader(ds, batch_size, shuffle):
     )
 
 # ───────────────────────── Stage-1 (grid) ───────────────────────── #
-# For NumGLUE we still support Stage-1 on train.json (1 epoch), validating on test.json (EM).
 STAGE1_PATH = os.path.join(out_dir, f"stage1_results_{args.full_grad_every}_{args.update_percent}.txt")
 
-def stage1_grid_search(method: str):
+def stage1_grid_search():
     best_combo, best_val = None, -1.0
     monitor_key = "val_acc"  # For NumGLUE, this key reports EM internally.
     GRID_LRS = [1e-6, 5e-6, 1e-5, 5e-5, 1e-4]
-    GRID_BATCH = [4] if method_tag == "full" else [4, 8]
+    GRID_BATCH = [4, 8]
     with open(STAGE1_PATH, "w", encoding="utf-8") as f:
         f.write("# Stage-1 grid search results\n")
-        f.write(f"# model={model_name}  task={task_name}  method={method}  mask_mode={args.mask_mode}  max_epoch=1\n")
+        f.write(f"# model={model_name}  task={task_name}  method=GASDU  mask_mode={args.mask_mode}  max_epoch=1\n")
         f.write("lr\tbatch_size\tval_acc_pct(EM)\tavg_epoch_min\tpeak_gpu_gb\ttrain_samples_per_sec\n")
 
         for lr in GRID_LRS:
@@ -1404,26 +1312,25 @@ def stage1_grid_search(method: str):
                     torch_dtype=torch.bfloat16
                 )
 
-                model_ft = modify_model_for_finetuning(
+                model_ft = modify_model_for_gasdu(
                     base,
                     update_percent=args.update_percent,
                     use_dynamic_k=args.use_dynamic_k,
-                    method=method,
                     mask_mode=args.mask_mode,
-                    lora_rank=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
                     track_grad_norm_prop=False,
                     full_grad_every=args.full_grad_every,
                 )
 
-                # For NumGLUE we flip on numeric/EM evaluation behavior inside the module.
                 lit = CustomLightningModule(
                     math_numeric_eval=(is_math or is_numglue),
                     max_gen_new_tokens=32,
                     model=model_ft, tokenizer=tok, learning_rate=lr, task_name=task_name, forced_scheme=forced_scheme,
-                    # SFT params retained but effectively unused under GASDU:
-                    sft_enabled=False, sft_use_sm3=False, sft_total_train_steps=None, sft_grad_accum=1,
-                    sft_peft_config=getattr(model_ft, "_sft_peft_config", None),
+                    # SFT not used in GASDU
+                    sft_enabled=False,
+                    sft_use_sm3=False,
+                    sft_total_train_steps=None,
+                    sft_grad_accum=1,
+                    sft_peft_config=None,
                 )
 
                 ds_tr = GenericDataset(train_val, "train")
@@ -1482,7 +1389,7 @@ perform_stage1 = not args.stage2_only
 best_lr, best_bs = args.learning_rate, args.batch_size
 best_val_stage1 = 0.0
 if perform_stage1:
-    best_hparams, best_val_stage1 = stage1_grid_search(args.finetune_method)
+    best_hparams, best_val_stage1 = stage1_grid_search()
     if best_hparams:
         best_lr, best_bs = best_hparams
 print("─"*46)
@@ -1517,14 +1424,11 @@ with open(STAGE2_PATH, "w", encoding="utf-8") as f2:
             torch_dtype=torch.bfloat16
         )
 
-        model_ft = modify_model_for_finetuning(
+        model_ft = modify_model_for_gasdu(
             base,
             update_percent=args.update_percent,
             use_dynamic_k=args.use_dynamic_k,
-            method=args.finetune_method,
             mask_mode=args.mask_mode,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
             track_grad_norm_prop=args.track_grad_norm_prop,
             full_grad_every=args.full_grad_every,
         ).to(device)
@@ -1533,9 +1437,11 @@ with open(STAGE2_PATH, "w", encoding="utf-8") as f2:
             math_numeric_eval=(is_math or is_numglue),
             max_gen_new_tokens=32,
             model=model_ft, tokenizer=tok, learning_rate=best_lr, task_name=task_name, forced_scheme=forced_scheme,
-            # SFT params retained but effectively unused under GASDU:
-            sft_enabled=False, sft_use_sm3=False, sft_total_train_steps=None, sft_grad_accum=1,
-            sft_peft_config=getattr(model_ft, "_sft_peft_config", None),
+            sft_enabled=False,
+            sft_use_sm3=False,
+            sft_total_train_steps=None,
+            sft_grad_accum=1,
+            sft_peft_config=None,
         )
 
         ds_tr = GenericDataset(train_val, "train")
@@ -1562,7 +1468,8 @@ with open(STAGE2_PATH, "w", encoding="utf-8") as f2:
             accelerator="gpu" if SELECTED_GPU is not None else "cpu",
             devices=[SELECTED_GPU] if SELECTED_GPU is not None else 1,
             precision="bf16-mixed", gradient_clip_val=1.0,
-            callbacks=[ForceTrainMode(), best_cb, tp_meter] + ([ratio_cb] if args.track_grad_norm_prop else []), logger=logger, log_every_n_steps=200,
+            callbacks=[ForceTrainMode(), best_cb, tp_meter] + ([ratio_cb] if args.track_grad_norm_prop else []),
+            logger=logger, log_every_n_steps=200,
             strategy=SingleDeviceStrategy(device=device) if SELECTED_GPU is not None else None,
             enable_checkpointing=False,
         )

@@ -1,4 +1,3 @@
-# gasdu.py
 ###############################################################################
 # gasdu.py — Sparse-gradient linear layer for GASDU (delta-param mode)
 #
@@ -17,10 +16,6 @@
 #   - Uses chunked index_add_ to avoid materializing [N,K] temporaries
 #   - Keeps bf16 where safe; small reductions in fp32 for stability
 #   - Optional cross-module D2H bucketing to coalesce small CPU logs
-#
-# Backward-compat:
-#   • Env keys now prefer GASDU_* but fall back to legacy GODLU_* if set.
-#   • golu_flush_buckets() alias is preserved for older callers.
 ###############################################################################
 
 from __future__ import annotations
@@ -31,20 +26,6 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ──────────────────────── env helper (back-compat) ───────────────────────── #
-def _getenv(key: str, default: str = "") -> str:
-    """Prefer GASDU_*; fall back to legacy GODLU_*."""
-    v = os.getenv(key)
-    if v is not None:
-        return v
-    if key.startswith("GASDU_"):
-        legacy = "GODLU_" + key[len("GASDU_"):]
-        v2 = os.getenv(legacy)
-        if v2 is not None:
-            return v2
-    return default
 
 
 # ────────────────────────────── helpers ──────────────────────────────────── #
@@ -63,7 +44,7 @@ def _low_priority_stream() -> Optional[torch.cuda.Stream]:
 class _GradBucket:
     """Global bucket to coalesce D2H copies across modules.
 
-    Enable by setting env var GASDU_BUCKET_BYTES (or legacy GODLU_BUCKET_BYTES).
+    Enable by setting env var GASDU_BUCKET_BYTES (e.g., 4000000).
     Call gasdu_flush_buckets() once per batch to force a flush at safe points.
     """
     def __init__(self, threshold_bytes: int = 0):
@@ -108,15 +89,11 @@ class _GradBucket:
         self._total_bytes = 0
 
 
-_BUCKET = _GradBucket(int(_getenv("GASDU_BUCKET_BYTES", "0"))) if torch.cuda.is_available() else _GradBucket(0)
+_BUCKET = _GradBucket(int(os.getenv("GASDU_BUCKET_BYTES", "0"))) if torch.cuda.is_available() else _GradBucket(0)
 
 def gasdu_flush_buckets():
     if _BUCKET is not None:
         _BUCKET.flush()
-
-# Legacy alias
-def golu_flush_buckets():
-    gasdu_flush_buckets()
 
 
 # ───────────────────────────── Streaming Top-K (exact) ───────────────────── #
@@ -143,8 +120,8 @@ def _topk_indices_streaming(grad_out_2d: torch.Tensor,
         z = torch.empty(0, dtype=torch.long, device=device)
         return z, z
 
-    tile_o = int(_getenv("GASDU_TILE_O", "1024")) if tile_o is None else int(tile_o)
-    tile_i = int(_getenv("GASDU_TILE_I", "1024")) if tile_i is None else int(tile_i)
+    tile_o = int(os.getenv("GASDU_TILE_O", "1024")) if tile_o is None else int(tile_o)
+    tile_i = int(os.getenv("GASDU_TILE_I", "1024")) if tile_i is None else int(tile_i)
     tile_o = max(1, min(tile_o, O))
     tile_i = max(1, min(tile_i, I))
 
@@ -155,7 +132,7 @@ def _topk_indices_streaming(grad_out_2d: torch.Tensor,
     GO = grad_out_2d.to(torch.bfloat16)  # [N,O]
     X  = x_2d.to(torch.bfloat16)         # [N,I]
 
-    POOL_MULT = int(_getenv("GASDU_TOPK_POOL_MULT", "8"))
+    POOL_MULT = int(os.getenv("GASDU_TOPK_POOL_MULT", "8"))
     POOL_CAP  = max(k, POOL_MULT * k)
 
     for o0 in range(0, O, tile_o):
@@ -225,7 +202,7 @@ class _SparseUpdateLinearFn(torch.autograd.Function):
             x2d = input.reshape(N, I)
             out2d = out.reshape(N, O)
 
-            CH = int(_getenv("GASDU_K_CHUNK", "4096"))
+            CH = int(os.getenv("GASDU_K_CHUNK", "4096"))
             for j0 in range(0, k_act, CH):
                 j1 = min(k_act, j0 + CH)
                 cols = mod.col_idx[j0:j1]                         # [j]
@@ -246,7 +223,6 @@ class _SparseUpdateLinearFn(torch.autograd.Function):
 
         (x_saved_bf16,) = ctx.saved_tensors
 
-        # Flatten grads, keep bf16 where safe
         if grad_output.dim() == 3:
             B, S, O = grad_output.shape
             grad_out = grad_output.reshape(-1, O).to(torch.bfloat16)     # [N, O]
@@ -257,47 +233,40 @@ class _SparseUpdateLinearFn(torch.autograd.Function):
 
         N, I = x_2d.shape
 
-        # ----- grad w.r.t input: dense base path -----
+        # dense base path gradient wrt input
         grad_input = grad_out.mm(weight.to(torch.bfloat16)).to(ctx.dtype)
 
-        # (A) Optional: full dense L2 for ratio logging
         full_l2 = None
         if getattr(mod, "track_grad_norm_prop", False):
             _full_grad = grad_out.t().mm(x_2d).to(torch.float32)  # [O, I]
             full_l2 = torch.norm(_full_grad, p=2)
 
-        # (B) Decide whether to REFRESH mask *this step*
+        # refresh policy
         if mod.row_idx.numel() == 0:
-            refresh = True  # initialize mask on first step
+            refresh = True
         elif mod.mask_mode == "fixed_topk":
             refresh = False
         elif mod.mask_mode == "topk_refresh_each_step":
             refresh = True
-        else:  # "topk" periodic refresh
+        else:  # "topk" periodic
             refresh = (mod._step % max(1, mod.full_grad_every) == 0)
 
-        # (C) If refresh, compute Top-K from current grads and INSTALL immediately
         if refresh:
             next_row, next_col = _topk_indices_streaming(grad_out, x_2d, int(mod.k))
             mod.row_idx = next_row.to(weight.device, non_blocking=True)
             mod.col_idx = next_col.to(weight.device, non_blocking=True)
-            # Optional CPU mirrors
             if mod.row_idx_cpu is not None:
                 mod.row_idx_cpu.resize_(int(mod.k))
                 mod.col_idx_cpu.resize_(int(mod.k))
                 mod.row_idx_cpu.copy_(mod.row_idx.detach().to(mod.row_idx_cpu.device), non_blocking=True)
                 mod.col_idx_cpu.copy_(mod.col_idx.detach().to(mod.col_idx_cpu.device), non_blocking=True)
 
-        # Effective mask for this step (fresh or kept)
         eff_rows = mod.row_idx
         eff_cols = mod.col_idx
-
-        # Active K (bounded by capacity & mask length)
         k_act = min(int(mod.k), eff_rows.numel(), eff_cols.numel(), mod.delta_vals.numel())
 
-        # (D) delta-path contribution to grad_input (current mask & current delta_vals)
         if k_act > 0 and torch.any(mod.delta_vals[:k_act] != 0):
-            CH = int(_getenv("GASDU_K_CHUNK", "4096"))
+            CH = int(os.getenv("GASDU_K_CHUNK", "4096"))
             for j0 in range(0, k_act, CH):
                 j1 = min(k_act, j0 + CH)
                 rows = eff_rows[j0:j1]
@@ -306,14 +275,12 @@ class _SparseUpdateLinearFn(torch.autograd.Function):
                 gi_add = grad_out[:, rows] * scales                      # [N, j]
                 grad_input.index_add_(1, cols, gi_add.to(grad_input.dtype))
 
-        # reshape back if needed
         if grad_output.dim() == 3:
             grad_input = grad_input.view(B, S, -1)
 
-        # ----- grad for delta_vals (uses the effective mask this step) -----
         if k_act > 0:
             part_grad = torch.empty(k_act, dtype=torch.float32, device=grad_out.device)
-            CH = int(_getenv("GASDU_K_CHUNK", "4096"))
+            CH = int(os.getenv("GASDU_K_CHUNK", "4096"))
             for j0 in range(0, k_act, CH):
                 j1 = min(k_act, j0 + CH)
                 go_sel = grad_out[:, eff_rows[j0:j1]]     # [N, j]
@@ -331,10 +298,8 @@ class _SparseUpdateLinearFn(torch.autograd.Function):
             if full_l2 is not None:
                 mod.latest_ratio = 0.0
 
-        # bias grad
         grad_bias = (grad_out.sum(dim=0).to(bias.dtype) if bias is not None else None)
 
-        # Optional async D2H logging of k values (current mask’s per-slot grads)
         if getattr(mod, "vals_cpu", None) is not None and k_act > 0:
             vals_gpu_cast = part_grad.to(torch.bfloat16).contiguous()
             if mod.vals_cpu.numel() != vals_gpu_cast.numel():
@@ -348,7 +313,6 @@ class _SparseUpdateLinearFn(torch.autograd.Function):
 
         mod._step += 1
 
-        # Grads for inputs of .apply(): (input, weight, bias, delta_vals, module_ref)
         return (grad_input, None, grad_bias, grad_delta, None)
 
 
@@ -369,10 +333,9 @@ class SparseUpdateLinear(nn.Module):
     Env tunables:
       GASDU_TILE_O, GASDU_TILE_I      – Top-K tile sizes (default 1024)
       GASDU_TOPK_POOL_MULT            – candidate pool multiplier (default 8)
-      GASDU_K_CHUNK                   – per-chunk K for index_add_ (default 4096)
+      GASDU_K_CHUNK                   – per-chunk K used in chunked index_add_ (default 4096)
       GASDU_BUCKET_BYTES              – D2H bucket threshold (0 disables)
-      GASDU_LOG_VALUES                – if "1", logs per-step k values to pinned CPU (allocate on first forward)
-      (All support legacy GODLU_* keys for backward compatibility.)
+      GASDU_LOG_VALUES                – if "1", allocate pinned value buffer for logging
     """
 
     def __init__(self, *,
@@ -410,7 +373,7 @@ class SparseUpdateLinear(nn.Module):
         if bucket_bytes is not None:
             self.bucket_bytes = int(bucket_bytes)
         else:
-            self.bucket_bytes = int(_getenv("GASDU_BUCKET_BYTES", "0")) if torch.cuda.is_available() else 0
+            self.bucket_bytes = int(os.getenv("GASDU_BUCKET_BYTES", "0")) if torch.cuda.is_available() else 0
 
         # dynamic-k schedule
         self.use_dynamic_k = bool(use_dynamic_k)
@@ -431,7 +394,7 @@ class SparseUpdateLinear(nn.Module):
 
         # parameters --------------------------------------------------------
         self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
-        self.weight.requires_grad = False
+        self.weight.requires_grad_(False)
 
         if old_linear is not None and getattr(old_linear, "bias", None) is None:
             self.register_parameter("bias", None)
@@ -477,13 +440,12 @@ class SparseUpdateLinear(nn.Module):
             new_k = max(self.k_final, int(round(self.k_initial * (self.decay_rate ** self.current_step))))
             self.k = int(new_k)
             self.current_step += 1
-        # do not exceed delta capacity
         self.k = min(self.k, self.delta_vals.numel())
 
     # ───────────────── forward ────────────── #
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self._update_k()
-        if self.vals_cpu is None and int(self.k) > 0 and _getenv("GASDU_LOG_VALUES", "0") == "1":
+        if self.vals_cpu is None and int(self.k) > 0 and os.getenv("GASDU_LOG_VALUES", "0") == "1":
             self.vals_cpu = torch.empty(int(self.k), dtype=torch.bfloat16, device="cpu").pin_memory()
         return _SparseUpdateLinearFn.apply(x, self.weight, self.bias, self.delta_vals, self)
 
@@ -502,4 +464,4 @@ class SparseUpdateLinear(nn.Module):
             self.delta_vals.data.zero_()
 
 
-__all__ = ["SparseUpdateLinear", "gasdu_flush_buckets", "golu_flush_buckets"]
+__all__ = ["SparseUpdateLinear", "gasdu_flush_buckets"]
