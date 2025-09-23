@@ -12,8 +12,8 @@ conda activate gasdu
 ```
 ## Quick Start: ARC-C
 ### GASDU training runs in two stages:
-### stage1: 1-epoch grid search over batch size and learning rate
-### stage2: 3-epoch fine-tuning using the best Stage 1 validation config
+- stage1: 1-epoch grid search over batch size and learning rate
+- stage2: 3-epoch fine-tuning using the best Stage 1 validation config
 
 ## run stage1 only:
 ```bash
