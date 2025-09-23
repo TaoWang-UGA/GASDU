@@ -9,13 +9,14 @@ Create and activate the Conda environment:
 ```bash
 conda env create -f environment.yml
 conda activate gasdu
+```
+## Quick Start: ARC-C
+### GASDU training runs in two stages:
+### stage1: 1-epoch grid search over batch size and learning rate
+### stage2: 3-epoch fine-tuning using the best Stage 1 validation config
 
-
-stage1: 1-epoch grid search over batch size and learning rate
-stage2: 3-epoch fine-tuning using best validation configuration:
-
-run stage1 only:
-
+## run stage1 only:
+```bash
 python train.py arc_c \
   --model_name "GPT-OSS-20B" \
   --finetune_method gasdu \
@@ -26,9 +27,11 @@ python train.py arc_c \
   --update_percent 0.01 \
   --mask_mode topk \
   --full_grad_every 50
+```
 
-run stage2 only:
+## run stage2 only:
 
+```bash
 python train.py arc_c \
   --model_name "GPT-OSS-20B" \
   --finetune_method gasdu \
@@ -39,9 +42,11 @@ python train.py arc_c \
   --update_percent 0.01 \
   --mask_mode topk \
   --full_grad_every 50
+```
 
-  run both:
+ ## run both:
   
+  ```bash
   python train.py arc_c \
   --model_name "GPT-OSS-20B" \
   --finetune_method gasdu \
@@ -51,3 +56,4 @@ python train.py arc_c \
   --update_percent 0.01 \
   --mask_mode topk \
   --full_grad_every 50
+```
