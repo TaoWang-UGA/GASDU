@@ -24,7 +24,7 @@ python train.py arc_c \
   --max_epoch 3 \
   --update_percent 0.01 \
   --mask_mode topk \
-  --full_grad_every 50
+  --full_grad_every 50 # mask refresh period
 ```
 
 ## run stage2 only:
@@ -35,11 +35,11 @@ python train.py arc_c \
   --finetune_method gasdu \
   --stage2_only \
   --max_epoch 3 \
-  --batch_size 8 \
+  --batch_size 8 \ # specify batch size and lr for stage2
   --learning_rate 5e-5 \
   --update_percent 0.01 \
   --mask_mode topk \
-  --full_grad_every 50
+  --full_grad_every 50 # mask refresh period
 ```
 
  ## run both:
@@ -51,5 +51,5 @@ python train.py arc_c \
   --max_epoch 3 \
   --update_percent 0.01 \
   --mask_mode topk \
-  --full_grad_every 50
+  --full_grad_every 50 # mask refresh period
 ```
