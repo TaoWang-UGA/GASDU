@@ -2,7 +2,7 @@
 
 A lightweight recipe for **Gradient–Southwell Dynamic Update (GASDU)** experiments.
 ## Data
-We have provided the exact commonsense and NumGLUE training and test data we used in our paper in this repository. Commonsense dataset is adopted from [adapter](https://github.com/AGI-Edgerunners/LLM-Adapters/tree/main/dataset). NumGLUE is adopted from [NumGLUE](https://github.com/allenai/numglue)
+We have provided the exact commonsense and NumGLUE training and test data we used in our paper in this repository. Commonsense dataset is adopted from [adapters](https://github.com/AGI-Edgerunners/LLM-Adapters/tree/main/dataset). NumGLUE is adopted from [NumGLUE](https://github.com/allenai/numglue)
 
 ## Installation
 
